@@ -1,156 +1,350 @@
-# Forward Chaining for First-Order Logic
+import re
 
-# Facts in the Knowledge Base
-KB = {
-    ("American", "Robert"),
-    ("Missile", "T1"),
-    ("Owns", "A", "T1"),
-    ("Enemy", "A", "America")
-}
 
-# Rules: (premises, conclusion)
-rules = [
-    (
-        [
-            ("American", "?p"),
-            ("Weapon", "?q"),
-            ("Sells", "?p", "?q", "?r"),
-            ("Hostile", "?r")
-        ],
-        ("Criminal", "?p")
-    ),
-    (
-        [
-            ("Missile", "?x"),
-            ("Owns", "A", "?x")
-        ],
-        ("Sells", "Robert", "?x", "A")
-    ),
-    (
-        [("Missile", "?x")],
-        ("Weapon", "?x")
-    ),
-    (
-        [("Enemy", "?x", "America")],
-        ("Hostile", "?x")
+# -------------------- PARSING --------------------
+
+def parse_literal(text):
+    text = text.strip()
+    negated = False
+
+    if text.startswith("¬") or text.startswith("~"):
+        negated = True
+        text = text[1:].strip()
+    elif re.match(r"(?i)^NOT\s+", text):
+        negated = True
+        text = re.sub(r"(?i)^NOT\s+", "", text).strip()
+
+    match = re.fullmatch(r"([A-Za-z_]\w*)\s*\((.*?)\)", text)
+
+    if not match:
+        raise ValueError(f"Invalid predicate: {text}")
+
+    name = match.group(1)
+    args_text = match.group(2).strip()
+    args = [arg.strip() for arg in args_text.split(",")] if args_text else []
+
+    if any(not arg for arg in args):
+        raise ValueError(f"Invalid arguments: {text}")
+
+    return name, args, negated
+
+
+def format_literal(literal):
+    name, args, negated = literal
+    prefix = "¬" if negated else ""
+    return prefix + name + "(" + ",".join(args) + ")"
+
+
+def parse_rule(text):
+    parts = re.split(r"->|=>|⟹", text, maxsplit=1)
+
+    if len(parts) != 2:
+        raise ValueError("Rule must contain an implication.")
+
+    body_text = parts[0].strip()
+    head_text = parts[1].strip()
+
+    # &, ^, ∧, /\, AND
+    body_parts = re.split(
+        r"\s*(?:&|\^|∧|/\\|(?i:AND))\s*",
+        body_text
     )
-]
+
+    body = [parse_literal(p) for p in body_parts if p.strip()]
+    head = parse_literal(head_text)
+
+    if not body:
+        raise ValueError("Rule body cannot be empty.")
+
+    body_variables = {
+        arg
+        for literal in body
+        for arg in literal[1]
+        if is_variable(arg)
+    }
+
+    head_variables = {
+        arg for arg in head[1] if is_variable(arg)
+    }
+
+    if not head_variables.issubset(body_variables):
+        raise ValueError("Rule head contains unbound variables.")
+
+    return body, head
 
 
-# Check whether a term is a variable
+# -------------------- VARIABLES --------------------
+
 def is_variable(term):
-    return term.startswith("?")
+    return bool(term) and term[0].islower()
 
 
-# Unify two predicates using substitutions
-def unify(pattern, fact, substitution):
-    if pattern[0] != fact[0] or len(pattern) != len(fact):
+# -------------------- UNIFICATION --------------------
+
+def substitute_term(term, substitutions):
+    while term in substitutions:
+        new_term = substitutions[term]
+
+        if new_term == term:
+            break
+
+        term = new_term
+
+    return term
+
+
+def unify_literals(literal1, literal2, substitutions):
+    name1, args1, neg1 = literal1
+    name2, args2, neg2 = literal2
+
+    if name1 != name2 or neg1 != neg2:
         return None
 
-    substitution = substitution.copy()
+    if len(args1) != len(args2):
+        return None
 
-    for p, f in zip(pattern[1:], fact[1:]):
+    subs = substitutions.copy()
 
-        # Replace variable if it already has a substitution
-        if is_variable(p):
-            if p in substitution:
-                if substitution[p] != f:
-                    return None
-            else:
-                substitution[p] = f
+    for a, b in zip(args1, args2):
+        a = substitute_term(a, subs)
+        b = substitute_term(b, subs)
 
-        elif p != f:
+        if a == b:
+            continue
+
+        if is_variable(a):
+            subs[a] = b
+        elif is_variable(b):
+            subs[b] = a
+        else:
             return None
 
-    return substitution
+    return subs
 
 
-# Apply substitutions to a predicate
-def substitute(predicate, substitution):
-    return tuple(
-        substitution.get(term, term)
-        for term in predicate
-    )
+def substitute_literal(literal, substitutions):
+    name, args, negated = literal
+
+    new_args = [
+        substitute_term(arg, substitutions)
+        for arg in args
+    ]
+
+    return name, new_args, negated
 
 
-# Match all premises of a rule with facts in KB
-def match_premises(premises, facts):
-    substitutions = [{}]
+# -------------------- MATCHING PREMISES --------------------
 
-    for premise in premises:
-        new_substitutions = []
+def match_premises(premises, kb, substitutions=None):
+    if substitutions is None:
+        substitutions = {}
 
-        for substitution in substitutions:
-            for fact in facts:
-                result = unify(premise, fact, substitution)
+    if not premises:
+        return [substitutions]
 
-                if result is not None:
-                    new_substitutions.append(result)
+    first = premises[0]
+    remaining = premises[1:]
 
-        substitutions = new_substitutions
+    results = []
 
-        if not substitutions:
-            break
+    first = substitute_literal(first, substitutions)
 
-    return substitutions
+    for fact in kb:
+        new_subs = unify_literals(first, fact, substitutions)
+
+        if new_subs is not None:
+            results.extend(
+                match_premises(remaining, kb, new_subs)
+            )
+
+    return results
 
 
-# Forward Chaining Algorithm
-def forward_chaining(KB, rules, query):
+# -------------------- DISPLAY --------------------
 
-    KB = set(KB)
-    iteration = 1
+def display_kb(kb, width=100):
+    facts = [format_literal(fact) for fact in kb]
 
-    print("Initial Facts:")
-    for fact in sorted(KB):
-        print(fact)
+    lines = []
+    current_line = ""
+
+    for fact in facts:
+        addition = fact if not current_line else ", " + fact
+
+        if len(current_line) + len(addition) > width and current_line:
+            lines.append(current_line + ",")
+            current_line = "   " + fact
+        else:
+            current_line += addition
+
+    if current_line:
+        lines.append(current_line)
+
+    return "\n".join(lines)
+
+
+def display_substitution(substitutions):
+    if not substitutions:
+        return "{}"
+
+    items = sorted(substitutions.items())
+
+    return "{" + ", ".join(
+        f"{key} = {substitute_term(value, substitutions)}"
+        for key, value in items
+    ) + "}"
+
+
+# -------------------- FORWARD CHAINING --------------------
+
+def forward_chaining(rules, kb, query):
+
+    round_number = 1
 
     while True:
-        new_facts = set()
 
-        print(f"\nIteration {iteration}:")
+        print(f"\n{round_number}) {display_kb(kb)}\n")
 
-        for premises, conclusion in rules:
+        new_facts = []
+        successful_applications = []
 
-            substitutions = match_premises(premises, KB)
+        current_kb = list(kb)
 
-            for substitution in substitutions:
+        for rule_number, (body, head) in enumerate(rules, start=1):
 
-                derived_fact = substitute(conclusion, substitution)
+            substitutions_list = match_premises(body, current_kb)
 
-                # Add only facts not already present in KB
-                if derived_fact not in KB:
-                    new_facts.add(derived_fact)
+            seen_substitutions = set()
 
-                    print("Matched:", [
-                        substitute(p, substitution)
-                        for p in premises
-                    ])
+            for substitutions in substitutions_list:
 
-                    print("Derived:", derived_fact)
+                sub_key = tuple(sorted(
+                    (k, substitute_term(v, substitutions))
+                    for k, v in substitutions.items()
+                ))
 
-        # Stop when no new facts can be inferred
+                if sub_key in seen_substitutions:
+                    continue
+
+                seen_substitutions.add(sub_key)
+
+                inferred = substitute_literal(head, substitutions)
+
+                # Only ground conclusions are accepted
+                if any(is_variable(arg) for arg in inferred[1]):
+                    continue
+
+                if inferred not in current_kb and inferred not in new_facts:
+
+                    new_facts.append(inferred)
+
+                    successful_applications.append(
+                        (rule_number, body, substitutions, inferred)
+                    )
+
+        # Display successful applications only
+        for rule_number, body, substitutions, inferred in successful_applications:
+
+            original_head = rules[rule_number - 1][1]
+
+            original_rule = (
+                " & ".join(format_literal(literal) for literal in body)
+                + " -> "
+                + format_literal(original_head)
+            )
+
+            matched_premises = ", ".join(
+                format_literal(substitute_literal(literal, substitutions))
+                for literal in body
+            )
+
+            print(
+                f"   R{rule_number}) {original_rule}, "
+                f"{display_substitution(substitutions)}"
+            )
+
+            print(
+                f"       {matched_premises} -> "
+                f"{format_literal(inferred)}"
+            )
+
+            print()
+
         if not new_facts:
+            print("   No new facts derived.")
             break
 
-        KB.update(new_facts)
-        iteration += 1
+        kb.extend(new_facts)
+        round_number += 1
 
-    print("\nFinal Knowledge Base:")
-    for fact in sorted(KB):
-        print(fact)
+    # -------------------- QUERY --------------------
 
-    if query in KB:
-        print("\nQuery:", query)
-        print("Result: TRUE")
-        print("Robert is a criminal.")
-    else:
-        print("\nQuery:", query)
-        print("Result: FALSE")
-        print("Could not prove that Robert is a criminal.")
+    print("\n==========================================")
+    print("QUERY RESULT:")
+    print(f"Query: {format_literal(query)}")
+
+    proved = any(
+        unify_literals(query, fact, {}) is not None
+        for fact in kb
+    )
+
+    print("PROVED" if proved else "NOT PROVED")
+    print("==========================================")
 
 
-# Query
-query = ("Criminal", "Robert")
+# -------------------- INPUT --------------------
 
-forward_chaining(KB, rules, query)
+print("==========================================")
+print("FORWARD CHAINING")
+print("==========================================")
+
+print("\nEnter rules (DONE to finish):")
+
+rules = []
+rule_number = 1
+
+while True:
+    line = input(f"R{rule_number}) ").strip()
+
+    if line.upper() == "DONE":
+        break
+
+    if not line:
+        continue
+
+    try:
+        rules.append(parse_rule(line))
+        rule_number += 1
+
+    except ValueError as error:
+        print(f"Invalid rule: {error}")
+
+
+print("\nEnter facts (DONE to finish):")
+
+kb = []
+
+while True:
+    line = input().strip()
+
+    if line.upper() == "DONE":
+        break
+
+    if not line:
+        continue
+
+    try:
+        fact = parse_literal(line)
+
+        if fact not in kb:
+            kb.append(fact)
+
+    except ValueError as error:
+        print(f"Invalid fact: {error}")
+
+
+print("\nEnter query:")
+
+query = parse_literal(input().strip())
+
+forward_chaining(rules, kb, query)
